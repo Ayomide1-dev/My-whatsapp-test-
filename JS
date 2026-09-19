@@ -1,0 +1,167 @@
+// server.js
+// WhatsApp Test Automation Bot
+// Stack: Node.js + Express + Twilio WhatsApp Sandbox + Google Gemini (free tier)
+// Deploy target: Render.com
+
+const express = require("express");
+const bodyParser = require("body-parser");
+const twilio = require("twilio");
+require("dotenv").config();
+
+const app = express();
+app.use(bodyParser.urlencoded({ extended: false }));
+app.use(bodyParser.json());
+
+const PORT = process.env.PORT || 3000;
+
+// ---- Config (from environment variables) ----
+const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
+const GEMINI_MODEL = process.env.GEMINI_MODEL || "gemini-2.0-flash"; // free-tier friendly model
+const TWILIO_ACCOUNT_SID = process.env.TWILIO_ACCOUNT_SID;
+const TWILIO_AUTH_TOKEN = process.env.TWILIO_AUTH_TOKEN;
+const TWILIO_WHATSAPP_FROM = process.env.TWILIO_WHATSAPP_FROM; // e.g. "whatsapp:+14155238886" (Twilio sandbox number)
+
+// Simple in-memory store of last few messages per sender (for lightweight context)
+// NOTE: resets on every deploy/restart since Render free tier has an ephemeral filesystem.
+const conversationHistory = {}; // { "whatsapp:+234...": [ {role, text}, ... ] }
+const MAX_HISTORY = 6;
+
+// Twilio client (used only if you want to actively SEND messages, not just reply)
+const twilioClient =
+  TWILIO_ACCOUNT_SID && TWILIO_AUTH_TOKEN
+    ? twilio(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
+    : null;
+
+// ---------- Health check (Render pings this / useful for uptime monitors) ----------
+app.get("/", (req, res) => {
+  res.status(200).send("✅ WhatsApp Gemini bot is running.");
+});
+
+// ---------- Gemini call ----------
+async function askGemini(userMessage, history = []) {
+  if (!GEMINI_API_KEY) {
+    throw new Error("Missing GEMINI_API_KEY environment variable.");
+  }
+
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${GEMINI_API_KEY}`;
+
+  // Build simple multi-turn context from history
+  const contents = [
+    ...history.map((h) => ({
+      role: h.role === "user" ? "user" : "model",
+      parts: [{ text: h.text }],
+    })),
+    { role: "user", parts: [{ text: userMessage }] },
+  ];
+
+  const body = {
+    contents,
+    generationConfig: {
+      temperature: 0.7,
+      maxOutputTokens: 512,
+    },
+  };
+
+  const response = await fetch(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+
+  if (!response.ok) {
+    const errText = await response.text();
+    throw new Error(`Gemini API error (${response.status}): ${errText}`);
+  }
+
+  const data = await response.json();
+
+  const reply =
+    data?.candidates?.[0]?.content?.parts?.map((p) => p.text).join("") ||
+    "Sorry, I couldn't generate a response right now.";
+
+  return reply;
+}
+
+// ---------- WhatsApp webhook (Twilio calls this on every incoming message) ----------
+// Configure this URL in the Twilio Sandbox settings as:
+//   https://YOUR-RENDER-URL.onrender.com/whatsapp
+app.post("/whatsapp", async (req, res) => {
+  const incomingMsg = (req.body.Body || "").trim();
+  const from = req.body.From; // e.g. "whatsapp:+2348012345678"
+
+  console.log(`📩 Incoming from ${from}: ${incomingMsg}`);
+
+  const twiml = new twilio.twiml.MessagingResponse();
+
+  try {
+    if (!incomingMsg) {
+      twiml.message("Send me a text message and I'll reply using Gemini AI 🤖");
+      res.type("text/xml").send(twiml.toString());
+      return;
+    }
+
+    // Basic test commands, useful for "test automation" scenarios
+    if (incomingMsg.toLowerCase() === "/ping") {
+      twiml.message("pong ✅");
+      res.type("text/xml").send(twiml.toString());
+      return;
+    }
+
+    if (incomingMsg.toLowerCase() === "/reset") {
+      conversationHistory[from] = [];
+      twiml.message("🧹 Conversation history cleared.");
+      res.type("text/xml").send(twiml.toString());
+      return;
+    }
+
+    // Maintain short rolling history per sender
+    const history = conversationHistory[from] || [];
+
+    const aiReply = await askGemini(incomingMsg, history);
+
+    // Update history
+    history.push({ role: "user", text: incomingMsg });
+    history.push({ role: "model", text: aiReply });
+    conversationHistory[from] = history.slice(-MAX_HISTORY);
+
+    twiml.message(aiReply);
+    res.type("text/xml").send(twiml.toString());
+  } catch (err) {
+    console.error("❌ Error handling message:", err.message);
+    twiml.message(
+      "⚠️ Something went wrong generating a reply. Check server logs."
+    );
+    res.type("text/xml").send(twiml.toString());
+  }
+});
+
+// ---------- Optional: proactively SEND a WhatsApp message (for scheduled/triggered tests) ----------
+// POST /send  { "to": "whatsapp:+2348012345678", "message": "Hello from automation" }
+app.post("/send", async (req, res) => {
+  try {
+    if (!twilioClient) {
+      return res
+        .status(500)
+        .json({ error: "Twilio client not configured (missing SID/token)." });
+    }
+    const { to, message } = req.body;
+    if (!to || !message) {
+      return res.status(400).json({ error: "Provide 'to' and 'message'." });
+    }
+
+    const result = await twilioClient.messages.create({
+      from: TWILIO_WHATSAPP_FROM,
+      to,
+      body: message,
+    });
+
+    res.json({ success: true, sid: result.sid });
+  } catch (err) {
+    console.error("❌ Error sending message:", err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.listen(PORT, () => {
+  console.log(`🚀 Server listening on port ${PORT}`);
+});
